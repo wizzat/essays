@@ -9,7 +9,7 @@ The data warehouse is populated via an "ETL" process: by extracting data from va
 
 Let's work out the costs of running a data warehouse. Data processing is often I/O bound because the datasets are much larger than can fit in memory, so CPU costs will be almost entirely neglected. Note that an I/O bound system can often benefit from spending a few CPU cycles compressing data, but we will neglect that for now. Instead, we will just focus on how much data needs to be moved around.
 
-Let's examine a relatively well understood use case: tracking ad impressions for brand awareness advertising. This ignores clicks, conversions, and several other important features of actual advertising. Additionally, let's use an ad DSP (Demand Side Platform) serving 400,000 ad impressions/second for a total of 34.5 billion impressions/day. On average, the DSP works with 1000 advertisers who on average have 10 destination urls and 100 creatives. There's also 20 billion internet enabled devices for this example, and all of them eventually see an ad from this DSP.
+Let's examine a relatively well understood use case: tracking ad impressions for brand awareness advertising. This ignores clicks, conversions, and several other important features of actual advertising. Additionally, let's use an ad DSP (Demand Side Platform) serving 400,000 ad impressions/second for a total of 34.5 billion impressions/day. On average, the DSP works with 1000 advertisers who on average have 10 destination URLs and 100 creatives. There's also 20 billion internet enabled devices for this example, and all of them eventually see an ad from this DSP.
 
 The ad tracking servers are emitting JSON formatted events that look like this:
 
@@ -69,7 +69,7 @@ In this case, the data on the ad tracking servers is periodically collected and 
 
 Once the data is in the stage table, missing dimensions need to be created. There's a linear cost for scanning the stage table for each dimension, as well as the cost for scanning the dimension tables. Because the total number of elements in the dimension tables is so small, the I/O cost for scanning them is going to be neglected.
 
-Once the dimension keys exist for all of the data in the stage table, it's ready to be inserted into the fact table. Inserting into a fact table in a data warehouse is usually more complicated than a simple insert. Instead, the data must be carefully checked to ensure that it is inserted into the correct partition. These partitions act as logical dividers inside the fact that naturally partition the search space for queries and also prevent indexes from getting too large.
+Once the dimension keys exist for all of the data in the stage table, it's ready to be inserted into the fact table. Inserting into a fact table in a data warehouse is usually more complicated than a simple insert. Instead, the data must be carefully checked to ensure that it is inserted into the correct partition. Partitions act as "sub tables" that naturally divide the search space for queries and prevent indexes from getting too large.
 
 This is also the last step where duplicate data can be taken care of before corrupting the fact data. It's generally trivial enough to group by all fields or provide a distinct operator. Either one generally results in a `n log n` sort of the underlying dataset, so this step can be expensive on the read side as well as for writing. Here's a visualization of what the data flow looks like so far:
 
@@ -213,9 +213,9 @@ This is an example ETL that calculates one of the 40 required aggregate tables:
     GROUP BY 1, 2;
     -- Cost = 2.2tb
 
-It may seem like processing the dataset so many times is inefficient, but as with any mature technique, there are always a myriad of ways to optimize it. One of the most important ways to optimize processing is by utilizing knowledge of the business domain. For our example, it almost never makes sense to create reports that group by creative or destination url without also including advertiser. This allows us to cut 3 tables per cube down to a only 5.
+It may seem like processing the dataset so many times is inefficient, but as with any mature technique, there are always a myriad of ways to optimize it. One of the most important ways to optimize processing is by utilizing knowledge of the business domain. For our example, it almost never makes sense to create reports that group by creative or destination URL without also including advertiser. This allows us to cut 3 of the 8 potential aggregate tables per cube down to only 5.
 
-Additionally, it is sometimes possible to use "low level" aggregations grouped by more dimensions as a data source for building "high level" aggregations grouped by some subset of dimensions. These relationships are often chained to produce a heierarchy tuned for delivery time or minimal cost.
+Additionally, it is sometimes possible to use "low level" aggregations grouped by more dimensions as a data source for building "high level" aggregations grouped by some subset of dimensions. These relationships are often chained to produce a hierarchy tuned for delivery time or minimal cost.
 
 ![Hierarchical Updates](images/imp_hierarchy.png)
 
