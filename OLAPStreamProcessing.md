@@ -271,7 +271,7 @@ The total cost matrix after switching to hourly builds, HLL++ for uniques, and h
 * Daily: 27.tb
 * Weekly: 25.3gb (Built from daily)
 * Monthly: 83gb (Built from daily)
-* Quarterly: 15gb (Built frmo monthly) 
+* Quarterly: 15gb (Built frmo monthly)
 * Yearly:  38gb (Built from monthly)
 * Total: 83tb
 
@@ -283,7 +283,7 @@ Let's take a step back and look at the batch processing system from the very beg
 
 ![Batch Ad System](images/batch_ad_system.png)
 
-The first point of obvious inefficiency is that we have to scan `impressions_stage` for each dimension in the impressions table. Additionally, the cost of building the first HLL aggregate table is tremendous. Furthermore, the need for more up to date data never seems to go away. It would be ideal to solve all of these problems simultaneously. 
+The first point of obvious inefficiency is that we have to scan `impressions_stage` for each dimension in the impressions table. Additionally, the cost of building the first HLL aggregate table is tremendous. Furthermore, the need for more up to date data never seems to go away. It would be ideal to solve all of these problems simultaneously.
 
 Stream processing is the idea of taking a (potentially never ending) "stream" of data and applying operations to every element of the stream. Many of these operations can be done in parallel, while others may require some ordering. Here's an example of stream processing that illustrates both parallel and sequential steps:
 
@@ -299,23 +299,28 @@ Stream processing is the idea of taking a (potentially never ending) "stream" of
     def process_dest_url(imp_event):
         imp_event.dest_url_id = DestUrlService.lookup(imp_event.dest_url)
 
+    def process_event(imp_event):
+        futures.wait([
+            executor.submit(process_user, imp_event),
+            executor.submit(process_creative, imp_event),
+            executor.submit(process_dest_url, imp_event),
+            executor.submit(process_advertiser, imp_event),
+        ])
+
+        return imp_event
+
     def process_stream(stream):
         events = []
         committed_offset = stream.offset
 
         for datum in stream:
             imp_event, offset = datum
-            futures.wait([
-                executor.submit(process_user, imp_event),
-                executor.submit(process_creative, imp_event),
-                executor.submit(process_dest_url, imp_event),
-                executor.submit(process_advertiser, imp_event),
-            ])
 
-            events.append(imp_event)
+            proc_event = process_event(imp_event)
+            events.append(proc__event)
             if len(events) >= 62500:
                 # Batch size: 18.75mb read, 4mb write
-                flush_to_database(events)
+                write_impressions(events)
                 events.clear()
                 stream.commit(offset)
 
@@ -331,10 +336,36 @@ It may also seem incongruous that a streaming system would batch writes into the
 
 Making the stream processor deal with duplicate data can be accomplished in a completely robust way by permanently storing all objects in the data stream under a unique identifier (necessarily provided by the object and not the processor), or in a slightly less robust way by storing the data IDs in short term storage such as memcached or redis and skipping processing for objects that have already been seen.
 
-While this is an obvious improvement in both the cost of and the responsiveness of the ETL pipeline, it's really only half the job. The ultimate goal is to reduce the pain not only for the ETL pipeline, but also for generating and updating the OLAP cube that drives dashboards and reports.
+While this is an obvious improvement in both the cost of and the responsiveness of the ETL pipeline, it's really only half the job. The ultimate goal is to reduce the pain not only for the ETL pipeline, but also for generating and updating the OLAP cube that drives dashboards and reports. To tackle this problem, we first need to consider how to process the OLAP cube. The cube is already populated via HLL++ and hierarchical updates. The largest pain point is updating the first aggregate. In that spirit, it seems possible to update that aggregate at the same time the fact gets updated:
 
-It's also difficult to simply slap a few more steps onto the existing stream processor to update the OLAP cube, because all updates to the cube for a given data object would need to be applied atomically. This may be a supplied feature with some specialized OLAP data stores, but generally atomicity in a distributed system is guaranteed at the individual object level. Instead, it's generally easier and less error prone to let each breakdown of the cube update at its own rate with its own atomicity.
+    def create_agg_rows(events):
+        rows = collections.defaultdict(FirstSummaryRow)
 
-The naive solution - that will absolutely work -  is to setup a stream processor for each dimension combination that all read directly from the output queue of the fact stream processor. This has the advantage of being really fast to write, but has the disadvantage that each stream processor will effective scan the entire dataset once.
+        for event in events:
+            rows[FirstSummaryRow.key(event)].add(event)
 
-Alternatively, it's possible to maintain the directed graph of data dependency from before and dramatically shrink the amount of data required to generate the "higher level" tables that have fewer dimensional slices. This would require more development work, because the basic fact rows would have to be transformed into a common summary row format, including the serialized HLL/LQE structure.
+        # Generally ~5kb (2-3 rows) should come out of 18.75mb
+        write_agg_rows(rows.values())
+
+    def process_stream(stream):
+        events = []
+        committed_offset = stream.offset
+
+        for datum in stream:
+            imp_event, offset = datum
+
+            proc_event = process_event(imp_event)
+            events.append(proc__event)
+            if len(events) >= 62500:
+                # Batch size: 18.75mb read, 4mb write
+                write_impressions(events)
+                events.clear()
+                stream.commit(offset)
+
+
+
+// It's also difficult to simply slap a few more steps onto the existing stream processor to update the OLAP cube, because all updates to the cube for a given data object would need to be applied atomically. This may be a supplied feature with some specialized OLAP data stores, but generally atomicity in a distributed system is guaranteed at the individual object level. Instead, it's generally easier and less error prone to let each breakdown of the cube update at its own rate with its own atomicity.
+//
+// The naive solution - that will absolutely work -  is to setup a stream processor for each dimension combination that all read directly from the output queue of the fact stream processor. This has the advantage of being really fast to write, but has the disadvantage that each stream processor will effective scan the entire dataset once.
+//
+// Alternatively, it's possible to maintain the directed graph of data dependency from before and dramatically shrink the amount of data required to generate the "higher level" tables that have fewer dimensional slices. This would require more development work, because the basic fact rows would have to be transformed into a common summary row format, including the serialized HLL/LQE structure.
