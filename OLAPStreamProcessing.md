@@ -299,14 +299,40 @@ Stream processing is the idea of taking a (potentially never ending) "stream" of
     def process_dest_url(imp_event):
         imp_event.dest_url_id = DestUrlService.lookup(imp_event.dest_url)
 
-    events = []
-    def queue_event(imp_event):
-        events.append(imp_event)
-        if len(events) >= 62500: # 4mb
-            flush_to_database(events)
+    def process_stream(stream):
+        events = []
+        committed_offset = stream.offset
+
+        for datum in stream:
+            imp_event, offset = datum
+            futures.wait([
+                executor.submit(process_user, imp_event),
+                executor.submit(process_creative, imp_event),
+                executor.submit(process_dest_url, imp_event),
+                executor.submit(process_advertiser, imp_event),
+            ])
+
+            events.append(imp_event)
+            if len(events) >= 62500: # 4mb
+                flush_to_database(events)
+                events.clear()
+                stream.commit(offset)
+
+There are a couple of things to notice here. The first is that the data processing language has shifted from SQL to Python (or any other programming language). It's not that there's something wrong with SQL, it's that current implementations of it are batch oriented and data needs to _flow_. The key advantage of this solution is that the data is read directly from the ad tracking queue and inserted directly into the impressions table - bypassing `impressions_stage` entirely.
+
+A solution like this directly nails the theoretical limit in processing performance on the fact ingestion side: 10.4tb read + 2.2tb write. At first this may seem like fancy wizardry, but the trick is never actually storing the raw data in the data warehouse. The expensive scans to find missing dimensions are replaced by constant time calls to a look aside cache service. Missing dimensions still require writes to the database, but they are very targeted and almost all of the disk cost has been elimited. The magic really comes from only having to look at the impression once.
+
+However, there are still some problems in the above approach, though they're not immediately visible. Instead, they derive from questions relating to the quality of the data stream being fed to the stream processor. How is it guaranteed that we got all of the data, and that none of it is duplicated? For various reasons mostly relating to atomicity, delivering all the data exactly once is extraordinarily hard, and obviously missing data can never be counted at all. That means that a good stream processing system must be built upon a high quality data queue with incremental resumption and deal gracefully with duplicate data.
+
+An additional problem that isn't immediately obvious is that the stream processor is still batching inserts into the base fact table. The reason this is true is because sequential disk access for reads and writes is far more efficient than scattered or random disk access. The implication is that periodically we may process an event, only to have it fail to insert at a later stage in processing. This means that we would need to replay the data stream starting from before the error happened - meaning that guaranteeing a strongly ordered queue and idempotent stream processing updates are critically important.
+
+Making the stream processor deal with duplicate data can be accomplished in a completely robust way by permanently storing all objects in the data stream under a unique identifier (necessarily provided by the object and not the processor), or in a slightly less robust way by storing the data IDs in short term storage such as memcached or redis and skipping processing for objects that have already been seen. The `process_event` function effectively needs to be modified slightly:
 
     def process_event(stream_datum):
         imp_event, offset = stream_datum
+        if memcached.lookup(imp_event.ad_id):
+            return
+
         # This all happens in parallel
         futures.wait([
             executor.submit(process_user, imp_event),
@@ -315,40 +341,11 @@ Stream processing is the idea of taking a (potentially never ending) "stream" of
             executor.submit(process_advertiser, imp_event),
         ])
 
-        queue_event(fact_table, imp_event)
+        queue_write(fact_table, imp_event)
+        memcached.put(imp_event.ad_id, 1)
 
-    def run(stream):
-        for datum in stream:
-            process_event(datum)
-
-There are a couple of things to notice here. The first is that the data processing language has shifted from SQL to Python (or any other programming language). It's not that there's something wrong with SQL, it's that current implementations of it are batch oriented and data needs to _flow_. The key advantage of this solution is that the data is read directly from the ad tracking queue and inserted directly into the impressions table. This directly nails the theoretical limit in processing performance on the fact ingestion side: 10.4tb read + 2.2tb write.
-
-At first this may seem like fancy wizardry, but the trick is that never actually storing the raw data in the data warehouse. The expensive scans to 
-
-
-Now, the advantage of such a system is that the dimensions are (by definition) relatively low cardinality (total row count). This means that it's pretty easy to have all of the dimension lookups already in cache, and only hit the database when a new dimension value has been seen (such as a new advertiser). Almost all of the disk cost has been eliminated, and we only have to look at the impression once.
-
-There's still some problems in the above approach, though they're not immediately visible. Instead, they derive from questions relating to the quality of the data stream being fed to the stream processor. How is it guaranteed that we got all of the data, and that none of it is duplicated? For various reasons mostly relating to atomicity, delivering all the data exactly once is extraordinarily hard, and obviously missing data can never be counted at all. That means that a good stream processing system must be built upon a high quality data queue with incremental resumption and deal gracefully with duplicate data.
-
-An additional problem that isn't immediately obvious is that the stream processor is still going to batch up inserts into the base fact table. The reason this is true is because "sequential" disk access for reads and writes is far more efficient than "scattered" or "random" disk access. The implication is that periodically we may process an event, only to have it fail to insert at a later stage in processing. This means that we would need to replay the data stream starting from before the error happened - meaning that guaranteeing a strongly ordered queue and idempotent stream processing updates is also critically important.
-
-Making the stream processor deal with duplicate data can be accomplished in a completely robust way by permanently storing all objects in the data stream under a unique identifier (necessarily provided by the object), or in a slightly less robust way by storing the data IDs in short term storage such as memcached or redis and not processing any objects that have already been seen.
 
 While this is an obvious improvement in both the cost of and the responsiveness of the ETL pipeline, it's really only half the job. The ultimate goal is to reduce the pain not only for the ETL pipeline, but also for generating and updating the OLAP cube that drives dashboards and reports.
-
-Let's take a look at what one of the advertiser reports look like again:
-
-    SELECT
-        imp_time::date          AS day,
-        advertiser_id           AS advertiser_id,
-        COUNT(distinct user_id) AS num_users,
-        COUNT(*)                AS num_imps,
-        SUM(cost)               AS cost
-    FROM impressions
-    WHERE imp_time::date >= current_date-7
-    GROUP BY 1, 2
-
-The dimensions are day and `advertiser_id`, and the measures are `num_users`, `num_imps`, and `cost`. The number of impressions and cost are both immediately calculable given new values, however a count of users isn't. It's not knowable whether adding 1 to a user count of 107 will be 107 or 108. It's also not generally feasible to store the actual set of users. That means that good probabilistic data structures like Bloom Filters, HyperLogLog and Logarithmic Quantile Estimation are important for calculating measure values within an acceptable margin of error. No matter what, getting exact answers for these numbers will require querying the base fact data directly.
 
 It's also difficult to simply slap a few more steps onto the existing stream processor to update the OLAP cube, because all updates to the cube for a given data object would need to be applied atomically. This may be a supplied feature with some specialized OLAP data stores, but generally atomicity in a distributed system is guaranteed at the individual object level. Instead, it's generally easier and less error prone to let each breakdown of the cube update at its own rate with its own atomicity.
 
