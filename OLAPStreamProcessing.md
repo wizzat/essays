@@ -336,6 +336,8 @@ It may also seem incongruous that a streaming system would batch writes into the
 
 Making the stream processor deal with duplicate data can be accomplished in a completely robust way by permanently storing all objects in the data stream under a unique identifier (necessarily provided by the object and not the processor), or in a slightly less robust way by storing the data IDs in short term storage such as memcached or redis and skipping processing for objects that have already been seen.
 
+TODO: 552960 18.75mb batches/day (6.4/sec). Network cost (1ms/lookup), linear memory cost of hash lookups. Figure out how many basic aggregate rows per batch to do cost analysis of flat vs hierarchical builds. Discuss compressing db writes for all aggregates into same stream processor vs putting on another queue.
+
 While this is an obvious improvement in both the cost of and the responsiveness of the ETL pipeline, it's really only half the job. The ultimate goal is to reduce the pain not only for the ETL pipeline, but also for generating and updating the OLAP cube that drives dashboards and reports. To tackle this problem, we first need to consider how to process the OLAP cube. The cube is already populated via HLL++ and hierarchical updates. The largest pain point is updating the first aggregate. In that spirit, it seems possible to update that aggregate at the same time the fact gets updated:
 
     def create_agg_rows(events):
@@ -366,6 +368,6 @@ While this is an obvious improvement in both the cost of and the responsiveness 
 
 // It's also difficult to simply slap a few more steps onto the existing stream processor to update the OLAP cube, because all updates to the cube for a given data object would need to be applied atomically. This may be a supplied feature with some specialized OLAP data stores, but generally atomicity in a distributed system is guaranteed at the individual object level. Instead, it's generally easier and less error prone to let each breakdown of the cube update at its own rate with its own atomicity.
 //
-// The naive solution - that will absolutely work -  is to setup a stream processor for each dimension combination that all read directly from the output queue of the fact stream processor. This has the advantage of being really fast to write, but has the disadvantage that each stream processor will effective scan the entire dataset once.
+// The naive solution - that will absolutely work -  is to setup a stream processor for each dimension combination that all read directly from the output queue of the fact stream processor. This has the advantage of being really fast to write, but has the disadvantage that each stream processor will effectively scan the entire dataset once.
 //
 // Alternatively, it's possible to maintain the directed graph of data dependency from before and dramatically shrink the amount of data required to generate the "higher level" tables that have fewer dimensional slices. This would require more development work, because the basic fact rows would have to be transformed into a common summary row format, including the serialized HLL/LQE structure.
