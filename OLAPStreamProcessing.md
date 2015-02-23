@@ -63,7 +63,7 @@ In our particular example: the number of advertisers, creatives, and destination
 
 ## The Batch ETL Process
 
-It is necessary to consider how the raw data is processed into actual facts when calculating the cost of the data warehouse. Any sensible ad system will have access to most of the dimensions mentioned here at ad serving time, however most data warehouses aren't going to be that tightly coupled with the raw dataset. Thus, we will go through the act of extract dimensions and partitioning the dataset directly.
+It is necessary to consider how the raw data is processed into actual facts when calculating the cost of the data warehouse. Any sensible ad system will have access to most of the dimensions mentioned here at ad serving time, however most data warehouses aren't going to be that tightly coupled with the raw dataset. Thus, we will go through the act of extracting dimensions and partitioning the dataset directly.
 
 In this case, the data on the ad tracking servers is periodically collected and copied into the stage table in the data warehouse throughout the day. This is a linear cost across the raw dataset that's pretty unavoidable. This cost may end up being paid more than once for a particular block of ads if any load fails because data delivery must be on an "exactly once" or "at least once" semantic. That means that data may be (exactly) duplicated inside the stage table.
 
@@ -313,37 +313,23 @@ Stream processing is the idea of taking a (potentially never ending) "stream" of
             ])
 
             events.append(imp_event)
-            if len(events) >= 62500: # 4mb
+            if len(events) >= 62500:
+                # Batch size: 18.75mb read, 4mb write
                 flush_to_database(events)
                 events.clear()
                 stream.commit(offset)
 
 There are a couple of things to notice here. The first is that the data processing language has shifted from SQL to Python (or any other programming language). It's not that there's something wrong with SQL, it's that current implementations of it are batch oriented and data needs to _flow_. The key advantage of this solution is that the data is read directly from the ad tracking queue and inserted directly into the impressions table - bypassing `impressions_stage` entirely.
 
-A solution like this directly nails the theoretical limit in processing performance on the fact ingestion side: 10.4tb read + 2.2tb write. At first this may seem like fancy wizardry, but the trick is never actually storing the raw data in the data warehouse. The expensive scans to find missing dimensions are replaced by constant time calls to a look aside cache service. Missing dimensions still require writes to the database, but they are very targeted and almost all of the disk cost has been elimited. The magic really comes from only having to look at the impression once.
+A solution like this directly nails the theoretical limit in processing performance on the fact ingestion side: 10.4tb read + 2.2tb write. At first this may seem like fancy wizardry, but the trick is never actually storing the raw data in the data warehouse. All of the expensive scans to find missing dimensions are replaced by constant time calls to a look aside cache service. Missing dimensions still require writes to the database, but they are very targeted and dimension table scans aren't necessary. The magic really comes from only having to look at the impression and its associated metadata once.
 
-However, there are still some problems in the above approach, though they're not immediately visible. Instead, they derive from questions relating to the quality of the data stream being fed to the stream processor. How is it guaranteed that we got all of the data, and that none of it is duplicated? For various reasons mostly relating to atomicity, delivering all the data exactly once is extraordinarily hard, and obviously missing data can never be counted at all. That means that a good stream processing system must be built upon a high quality data queue with incremental resumption and deal gracefully with duplicate data.
+However, the above code has a lot more going on than immediately meets the eye. For example, stream processing systems are run in a highly parallel and concurrent manner. The ad tracking servers for the example ad DSP would all be feeding data into the queue simultaneously, while the stream processing consumers would all be pulling simultaneously. Thus, the queue needs to present a _MECE_ (Mutually Exclusive but Collectively Exhaustive) interface for consumption so that consumers can be written with confidence around accessing shared data stores.
 
-An additional problem that isn't immediately obvious is that the stream processor is still batching inserts into the base fact table. The reason this is true is because sequential disk access for reads and writes is far more efficient than scattered or random disk access. The implication is that periodically we may process an event, only to have it fail to insert at a later stage in processing. This means that we would need to replay the data stream starting from before the error happened - meaning that guaranteeing a strongly ordered queue and idempotent stream processing updates are critically important.
+Additionally, the _delivery semantics_ of message delivery become incredibly important for a stream processing system. For various reasons mostly relating to distributed atomicity, delivering data exactly once is extraordinarily difficult, and obviously missing data can never be counted at all. That means that a stream processing system relies on a high quality queue with _at least once_ delivery semantics. It's also of vital importance that consumers be written with an eye towards gracefully handling duplicate data.
 
-Making the stream processor deal with duplicate data can be accomplished in a completely robust way by permanently storing all objects in the data stream under a unique identifier (necessarily provided by the object and not the processor), or in a slightly less robust way by storing the data IDs in short term storage such as memcached or redis and skipping processing for objects that have already been seen. The `process_event` function effectively needs to be modified slightly:
+It may also seem incongruous that a streaming system would batch writes into the fact table. The reason this is true is because sequential disk access for reads and writes is far more efficient than scattered or random disk access. The implication is that periodically we may process an event only to have it fail to insert at a later stage in processing. This means that we would need to replay the data stream starting from before the error happened - meaning that it is critically important that the queue must give checkpoint control to the consumer and be strongly ordered and idempotent across application failures.
 
-    def process_event(stream_datum):
-        imp_event, offset = stream_datum
-        if memcached.lookup(imp_event.ad_id):
-            return
-
-        # This all happens in parallel
-        futures.wait([
-            executor.submit(process_user, imp_event),
-            executor.submit(process_creative, imp_event),
-            executor.submit(process_dest_url, imp_event),
-            executor.submit(process_advertiser, imp_event),
-        ])
-
-        queue_write(fact_table, imp_event)
-        memcached.put(imp_event.ad_id, 1)
-
+Making the stream processor deal with duplicate data can be accomplished in a completely robust way by permanently storing all objects in the data stream under a unique identifier (necessarily provided by the object and not the processor), or in a slightly less robust way by storing the data IDs in short term storage such as memcached or redis and skipping processing for objects that have already been seen.
 
 While this is an obvious improvement in both the cost of and the responsiveness of the ETL pipeline, it's really only half the job. The ultimate goal is to reduce the pain not only for the ETL pipeline, but also for generating and updating the OLAP cube that drives dashboards and reports.
 
