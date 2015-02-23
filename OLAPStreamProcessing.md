@@ -275,34 +275,56 @@ The total cost matrix after switching to hourly builds, HLL++ for uniques, and h
 * Yearly:  38gb (Built from monthly)
 * Total: 83tb
 
-83tb looks a whole lot better than 7.4pb, but it still seems pretty outrageous considering only 10.4tb of raw data came into the system. I think we can do better.
+IO costs going from 74pb to 83tb really puts a spot light on how painful `count(distinct)` is as a problem. Despite how much better 83tb in IO cost per day feels, it still seems pretty outrageous considering only 10.4tb of raw data came into the system. I think we can do better.
 
 ## Stream Processing for Faster Processing
 
-Let's take a step back and look at the batch processing system from the very beginning and consider the wasted steps, and how to optimize them away. This is what the system currently looks like:
+Let's take a step back and look at the batch processing system from the very beginning and consider the wasted steps, and how to optimize them away. This is what the data flow for this warehouse currently looks like:
 
 ![Batch Ad System](images/batch_ad_system.png)
 
-The first point of obvious inefficiency is that we have to scan `impressions_stage` for each dimension table. It would be trivial to have the ad tracking servers emit data in the proper format because they require all of that data to actually display an impression, however that would also ruin the example that the obvious solution isn't available for. Instead, we'll look towards a one pass linear solution for data coming from the ad tracking servers directly into the impressions table.
+The first point of obvious inefficiency is that we have to scan `impressions_stage` for each dimension in the impressions table. Additionally, the cost of building the first HLL aggregate table is tremendous. Furthermore, the need for more up to date data never seems to go away. It would be ideal to solve all of these problems simultaneously. 
 
-The largest problem, however, are the OLAP cubes. They just cost too much to create and maintain. Furthermore, they're constantly generating friction when an advertiser runs a year over year report, doesn't see today's data, and files a bug report about "wrong" dashboards.
-
-Stream processing is the idea of taking a (potentially never ending) "stream" of data and applying operations to every element of the stream. Many of these operations can be done in parallel, while others may require some ordering. Let's have an example for what steps might need to be taken with our example system:
+Stream processing is the idea of taking a (potentially never ending) "stream" of data and applying operations to every element of the stream. Many of these operations can be done in parallel, while others may require some ordering. Here's an example of stream processing that illustrates both parallel and sequential steps:
 
     def process_user(imp_event):
         imp_event.user_id = UserService.lookup(imp_event.user)
 
-    # ... more of these
+    def process_advertiser(imp_event):
+        imp_event.advertiser_id = AdvertiserService.lookup(imp_event.advertiser)
 
-    def process_event(imp_event):
-        # do all this in parallel
+    def process_creative(imp_event):
+        imp_event.creative_id = CreativeService.lookup(imp_event.creative)
+
+    def process_dest_url(imp_event):
+        imp_event.dest_url_id = DestUrlService.lookup(imp_event.dest_url)
+
+    events = []
+    def queue_event(imp_event):
+        events.append(imp_event)
+        if len(events) >= 62500: # 4mb
+            flush_to_database(events)
+
+    def process_event(stream_datum):
+        imp_event, offset = stream_datum
+        # This all happens in parallel
         futures.wait([
             executor.submit(process_user, imp_event),
             executor.submit(process_creative, imp_event),
-            # ... one of these for each dimension
+            executor.submit(process_dest_url, imp_event),
+            executor.submit(process_advertiser, imp_event),
         ])
 
-        insert_event(fact_table, imp_event)
+        queue_event(fact_table, imp_event)
+
+    def run(stream):
+        for datum in stream:
+            process_event(datum)
+
+There are a couple of things to notice here. The first is that the data processing language has shifted from SQL to Python (or any other programming language). It's not that there's something wrong with SQL, it's that current implementations of it are batch oriented and data needs to _flow_. The key advantage of this solution is that the data is read directly from the ad tracking queue and inserted directly into the impressions table. This directly nails the theoretical limit in processing performance on the fact ingestion side: 10.4tb read + 2.2tb write.
+
+At first this may seem like fancy wizardry, but the trick is that never actually storing the raw data in the data warehouse. The expensive scans to 
+
 
 Now, the advantage of such a system is that the dimensions are (by definition) relatively low cardinality (total row count). This means that it's pretty easy to have all of the dimension lookups already in cache, and only hit the database when a new dimension value has been seen (such as a new advertiser). Almost all of the disk cost has been eliminated, and we only have to look at the impression once.
 
