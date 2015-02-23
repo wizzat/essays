@@ -7,11 +7,11 @@ The data warehouse is populated via an "ETL" process: by extracting data from va
 
 ## The Example
 
-Let's work out the costs of running a data warehouse. Data processing is often IO bound because the datasets are much larger than can fit in memory, so CPU costs will be almost entirely neglected. Note that an IO bound system can often benefit from spending a few CPU cycles compressing data, but we will neglect that for now. Instead, we will just focus on how much data needs to be moved around.
+Let's work out the costs of running a data warehouse. Data processing is often I/O bound because the datasets are much larger than can fit in memory, so CPU costs will be almost entirely neglected. Note that an I/O bound system can often benefit from spending a few CPU cycles compressing data, but we will neglect that for now. Instead, we will just focus on how much data needs to be moved around.
 
 Let's examine a relatively well understood use case: tracking ad impressions for brand awareness advertising. This ignores clicks, conversions, and several other important features of actual advertising. Additionally, let's use an ad DSP (Demand Side Platform) serving 400,000 ad impressions/second for a total of 34.5 billion impressions/day. On average, the DSP works with 1000 advertisers who on average have 10 destination urls and 100 creatives. There's also 20 billion internet enabled devices for this example, and all of them eventually see an ad from this DSP.
 
-The basic fact data for an impression looks something like this:
+The ad tracking servers are emitting JSON formatted events that look like this:
 
     {
         "imp_id": "6076f140-ea53-47f5-a48f-8d1ea0ddc856",
@@ -21,7 +21,7 @@ The basic fact data for an impression looks something like this:
         "cost": 0.0000001,
         "creative": "http://www.facebook.com/some_creative.png",
         "dest_url": "https://www.facebook.com/wizzat"
-    } // 284 bytes
+    } // 284 bytes (round up to 300
 
 In the example, this ad impression data streams from the ad servers to a centralized location where it resides on disk ready to be processed once per day. SQL is exceedingly common for expressing data processing in data warehousing, so it will also form the basis for many of the examples here. The stage table schema the data would be dumped into throughout the day would look like this:
 
@@ -67,7 +67,7 @@ It is necessary to consider how the raw data is processed into actual facts when
 
 In this case, the data on the ad tracking servers is periodically collected and copied into the stage table in the data warehouse throughout the day. This is a linear cost across the raw dataset that's pretty unavoidable. This cost may end up being paid more than once for a particular block of ads if any load fails because data delivery must be on an "exactly once" or "at least once" semantic. That means that data may be (exactly) duplicated inside the stage table.
 
-Once the data is in the stage table, missing dimensions need to be created. There's a linear cost for scanning the stage table for each dimension, as well as the cost for scanning the dimension tables. All of the dimension tables except the users table are wholly neglectable. However, the users table is often both large enough and important enough to merit its own ETL pipeline with custom busines logic. We'll neglect that cost here as well.
+Once the data is in the stage table, missing dimensions need to be created. There's a linear cost for scanning the stage table for each dimension, as well as the cost for scanning the dimension tables. Because the total number of elements in the dimension tables is so small, the I/O cost for scanning them is going to be neglected.
 
 Once the dimension keys exist for all of the data in the stage table, it's ready to be inserted into the fact table. Inserting into a fact table in a data warehouse is usually more complicated than a simple insert. Instead, the data must be carefully checked to ensure that it is inserted into the correct partition. These partitions act as logical dividers inside the fact that naturally partition the search space for queries and also prevent indexes from getting too large.
 
@@ -120,9 +120,9 @@ Some efficiency (but not a lot) in this sample ETL has been sacrificed to illust
     -- metadata layer.
     TRUNCATE TABLE impressions_stage;
 
-    -- Total cost: 48tb read, 8tb write = 56tb IO cost
+    -- Total cost: 48tb read, 8tb write = 56tb I/O cost
 
-As long as the fact update rate matches the fact partition interval, the 56tb IO cost is fairly constant for a day no matter how many times the ETL runs. If the ETL runs less frequently, an additional scan per fact partition skipped will be required. If it runs more frequently, an additional scan of the entire existing fact partition will be required per run. An example: updating a daily partition once per hour would take the cost from 56tb to almost 82tb (an additional cost of `11.5 * 2.2tb = 25tb`.
+As long as the fact update rate matches the fact partition interval, the 56tb I/O cost is fairly constant for a day no matter how many times the ETL runs. If the ETL runs less frequently, an additional scan per fact partition skipped will be required. If it runs more frequently, an additional scan of the entire existing fact partition will be required per run. An example: updating a daily partition once per hour would take the cost from 56tb to almost 82tb (an additional cost of `11.5 * 2.2tb = 25tb`.
 
 ## OLAP Reporting
 
@@ -180,7 +180,7 @@ At its core, OLAP is all about having the ability to answer nearly arbitrary que
 
 ## OLAP Aggregates
 
-In an ideal and simplistic world, the reports in an OLAP system would always be run against the "base fact" tables. However, through the process of digging through just one set of questions we burned through a completely preposterous 62 tb of disk IO. In the real world, the fact data is often "rolled up" into aggregate or summary tables to store the result of these queries so that they can be used many times.
+In an ideal and simplistic world, the reports in an OLAP system would always be run against the "base fact" tables. However, through the process of digging through just one set of questions we burned through a completely preposterous 62 tb of disk I/O. In the real world, the fact data is often "rolled up" into aggregate or summary tables to store the result of these queries so that they can be used many times.
 
 Supporting the full definition of OLAP (rollups, drill downs, and slicing/dicing) requires an aggregate table for every dimension combination for a total of `2**n` aggregates. Precomputing and storing the data along every combination of dimensions is often called "cubing" the data, and the computed dataset is often called an "OLAP Cube".
 
@@ -248,9 +248,9 @@ However, in a fast paced business world, decisions often need to be made more qu
 * Yearly: 4pb -> 96.4pb (2497% total increase)
 * Total: 5.4pb -> 130pb (2428% total increase)
 
-It should be pretty apparent that updating all of the cubes every hour is completely impractical. It's much more possible to update just the daily and weekly aggregates once per hour and update the rest once per day. That would increase the processing cost to merely 7.4pb of IO per day. However, that's likely to lower confidence in the quality of the data warehouse and generate a never ending stream of bug reports when the daily cube has updated with the results of an advertising campaign but the monthly hasn't yet.
+It should be pretty apparent that updating all of the cubes every hour is completely impractical. It's much more possible to update just the daily and weekly aggregates once per hour and update the rest once per day. That would increase the processing cost to merely 7.4pb of I/O per day. However, that's likely to lower confidence in the quality of the data warehouse and generate a never ending stream of bug reports when the daily cube has updated with the results of an advertising campaign but the monthly hasn't yet.
 
-Additionally, 7.4pb of IO cost in a processing pipeline is no joke, even if almost all of it's reading. To put that in perspective, using ultra high end SSDs (2.5tb, 3000 MB/s seq read, $28k ea), it would take 2.5 million disk-seconds (29 disk days!) to fetch the data and process just one day of data. It's much more likely to take 713 disk-days using conventional HDDs at 120MB/sec seq read. It just boggles the mind that 10.4tb of input data resulted in 7.4pb of IO cost.
+Additionally, 7.4pb of I/O cost in a processing pipeline is no joke, even if almost all of it's reading. To put that in perspective, using ultra high end SSDs (2.5tb, 3000 MB/s seq read, $28k ea), it would take 2.5 million disk-seconds (29 disk days!) to fetch the data and process just one day of data. It's much more likely to take 713 disk-days using conventional HDDs at 120MB/sec seq read. It just boggles the mind that 10.4tb of input data resulted in 7.4pb of I/O cost.
 
 Before we give up entirely on this appraoch, it's worth looking at optimizations that we skipped. For instance, we weren't able to build our tables hierarchically because of the `num_users` measure. Is that measure _*REALLY*_ necessary? The customers will be pretty insistent on having it, so another solution is needed. As it turns out, Google published the HyperLogLog++ paper for estimating the number of uniques instead of actually counting them directly. It has the advantage that unions are easy, but intersections are _risky_. Storing HyperLogLog++ in the aggregate tables would increase the cost of a row by 2500 bytes, so the tables would look something like this:
 * `imps_by_advertiser_creative_dest_url_day` 1m rows/day * 2554 bytes/row = 2.5gb/day
@@ -275,7 +275,7 @@ The total cost matrix after switching to hourly builds, HLL++ for uniques, and h
 * Yearly:  38gb (Built from monthly)
 * Total: 83tb
 
-IO costs going from 74pb to 83tb really puts a spot light on how painful `count(distinct)` is as a problem. Despite how much better 83tb in IO cost per day feels, it still seems pretty outrageous considering only 10.4tb of raw data came into the system. I think we can do better.
+I/O costs going from 74pb to 83tb really puts a spot light on how painful `count(distinct)` is as a problem. Despite how much better 83tb in I/O cost per day feels, it still seems pretty outrageous considering only 10.4tb of raw data came into the system. I think we can do better.
 
 ## Stream Processing for Faster Processing
 
