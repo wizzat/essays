@@ -326,28 +326,37 @@ Stream processing is the idea of taking a (potentially never ending) "stream" of
 
 There are a couple of things to notice here. The first is that the data processing language has shifted from SQL to Python (or any other programming language). It's not that there's something wrong with SQL, it's that current implementations of it are batch oriented and data needs to _flow_. The key advantage of this solution is that the data is read directly from the ad tracking queue and inserted directly into the impressions table - bypassing `impressions_stage` entirely.
 
-A solution like this directly nails the theoretical limit in processing performance on the fact ingestion side: 10.4tb read + 2.2tb write. At first this may seem like fancy wizardry, but the trick is never actually storing the raw data in the data warehouse. All of the expensive scans to find missing dimensions are replaced by constant time calls to a look aside cache service. Missing dimensions still require writes to the database, but they are very targeted and dimension table scans aren't necessary. The magic really comes from only having to look at the impression and its associated metadata once.
+A solution like this directly nails the theoretical limit in processing performance on the fact ingestion side: 10.4tb read + 2.2tb write. At first this may seem like fancy wizardry, but the trick is to never actually store the raw data in the data warehouse. All of the expensive scans to find missing dimensions are replaced by constant time calls to a cache fronting a database. Missing dimensions still require writes to the database, but they are very targeted and table scans aren't necessary. The magic really comes from only having to look at the impression and its associated metadata once.
 
-However, the above code has a lot more going on than immediately meets the eye. For example, stream processing systems are run in a highly parallel and concurrent manner. The ad tracking servers for the example ad DSP would all be feeding data into the queue simultaneously, while the stream processing consumers would all be pulling simultaneously. Thus, the queue needs to present a _MECE_ (Mutually Exclusive but Collectively Exhaustive) interface for consumption so that consumers can be written with confidence around accessing shared data stores.
+However, the above code has a lot more going on than immediately meets the eye. For example, stream processing systems are run in a highly parallel and concurrent manner. The ad tracking servers for the example ad DSP would all be feeding data into the queue simultaneously, while the stream processing consumers would all be pulling simultaneously. In order for the stream processing system to not fall behind, it must process at least at the same rate as the ads are served (400k/sec). In order to maintain reasonable performance at the database layer, it is necessary to batch writes into the fact table as well. The reason for this is because sequential (bulk) disk access for reads and writes is far more efficient than scattered or random disk access. However, it doesn't take truly enormous batch sizes to make the system efficient - the 4mb size used above should work well in most scenarios.
 
-Additionally, the _delivery semantics_ of message delivery become incredibly important for a stream processing system. For various reasons mostly relating to distributed atomicity, delivering data exactly once is extraordinarily difficult, and obviously missing data can never be counted at all. That means that a stream processing system relies on a high quality queue with _at least once_ delivery semantics. It's also of vital importance that consumers be written with an eye towards gracefully handling duplicate data.
+It's also pretty obvious that no one consumer is going to process that stream alone. So a cluster of stream processors will need to divide the stream up in such away that each event is only processed once, ideally with as little coordination as possible. The requirement to divide the stream up this way means that the queue must provide a _MECE_ (Mutually Exclusive but Collectively Exhaustive) interface. This goal becomes more complicated once system failures are factored in and data which has been processed but not confirmed is lost. The queue not only needs to be MECE, but data which had previously been processed needs to be retried in the order it was originally sent. Thus, the system depends on having a high quality MECE queue with ordered delivery and frequent consumer controlled checkpoints.
 
-It may also seem incongruous that a streaming system would batch writes into the fact table. The reason this is true is because sequential disk access for reads and writes is far more efficient than scattered or random disk access. The implication is that periodically we may process an event only to have it fail to insert at a later stage in processing. This means that we would need to replay the data stream starting from before the error happened - meaning that it is critically important that the queue must give checkpoint control to the consumer and be strongly ordered and idempotent across application failures.
+Additionally, the _delivery semantics_ of the queue become incredibly important for a stream processing system. For various reasons mostly relating to distributed atomicity, delivering data exactly once is extraordinarily difficult, and obviously missing data can never be counted at all. That means that a stream processing system relies on a high quality queue with _at least once_ delivery semantics. Due to the intentional duplication deriving from delivery and process failures, it's of vital importance that consumers be written to properly handle deduplication.
 
-Making the stream processor deal with duplicate data can be accomplished in a completely robust way by permanently storing all objects in the data stream under a unique identifier (necessarily provided by the object and not the processor), or in a slightly less robust way by storing the data IDs in short term storage such as memcached or redis and skipping processing for objects that have already been seen.
+The deduplication method used in a batch processing system is inappropriate for stream processing because it requires access to the full dataset to decide whether any particular row is unique. However, a hashing algorithm can be done for each element of the stream as it comes in. The amount of active memory for deduplication depends on the window of required uniqueness and how important true uniqueness is for the application. This is particularly important when examining use cases for data that can arrive potentially very far out of time. For example, guaranteeing true uniqueness with a naive hash map in the example dataset for a single day would take ~553gb of RAM at 16 bytes per key. It may not be necessary to unique across the whole day, and it may also be possible to use a 55gb bloom filter with a 1% false positive error rate.
 
-TODO: 552960 18.75mb batches/day (6.4/sec). Network cost (1ms/lookup), linear memory cost of hash lookups. Figure out how many basic aggregate rows per batch to do cost analysis of flat vs hierarchical builds. Discuss compressing db writes for all aggregates into same stream processor vs putting on another queue.
+## Practical Considerations for Stream Processing
 
-While this is an obvious improvement in both the cost of and the responsiveness of the ETL pipeline, it's really only half the job. The ultimate goal is to reduce the pain not only for the ETL pipeline, but also for generating and updating the OLAP cube that drives dashboards and reports. To tackle this problem, we first need to consider how to process the OLAP cube. The cube is already populated via HLL++ and hierarchical updates. The largest pain point is updating the first aggregate. In that spirit, it seems possible to update that aggregate at the same time the fact gets updated:
+It's sometimes important to consider how stream processing works on a practical level. This is what the code snippet above looks like when adjusted to provide uniqueness:
+
+    def unique_event(imp_event):
+        imp_event.unique = UniqueService.lookup(imp_event.ad_id)
+
+    def process_event(imp_event):
+        futures.wait([
+            executor.submit(unique_event, imp_event),
+            executor.submit(process_user, imp_event),
+            executor.submit(process_creative, imp_event),
+            executor.submit(process_dest_url, imp_event),
+            executor.submit(process_advertiser, imp_event),
+        ])
+
+        return imp_event
 
     def create_agg_rows(events):
-        rows = collections.defaultdict(FirstSummaryRow)
-
         for event in events:
-            rows[FirstSummaryRow.key(event)].add(event)
-
-        # Generally ~5kb (2-3 rows) should come out of 18.75mb
-        write_agg_rows(rows.values())
+            write_row_to_queue(event, key=SummaryRow.key(event))
 
     def process_stream(stream):
         events = []
@@ -357,17 +366,45 @@ While this is an obvious improvement in both the cost of and the responsiveness 
             imp_event, offset = datum
 
             proc_event = process_event(imp_event)
-            events.append(proc__event)
+            if proc_event.unique_event:
+                events.append(proc__event)
+
             if len(events) >= 62500:
                 # Batch size: 18.75mb read, 4mb write
-                write_impressions(events)
+
+                futures.wait([
+                    executor.submit(insert_ignore_into_db, events),
+                    executor.submit(create_agg_rows, events),
+                ])
+                futures.wait([ executor.submit(UniqueService.set, x) for x in events ])
                 events.clear()
                 stream.commit(offset)
 
+The previous version of the streaming algorithm didn't account for deduplication, so this is a version that does. There is some notes taken from the Google MillWheel paper in exactly how the deduplication works. In this particular example, there is a primary key on the impressions partitions which is invoked for discarding duplicates that made it through due to error conditions. There are other optimizations available in the MillWheel paper that make this both more robust and faster. This is what the data flow looks like now:
 
+![Stream Processing Facts](images/stream_proc1.png)
 
-// It's also difficult to simply slap a few more steps onto the existing stream processor to update the OLAP cube, because all updates to the cube for a given data object would need to be applied atomically. This may be a supplied feature with some specialized OLAP data stores, but generally atomicity in a distributed system is guaranteed at the individual object level. Instead, it's generally easier and less error prone to let each breakdown of the cube update at its own rate with its own atomicity.
-//
-// The naive solution - that will absolutely work -  is to setup a stream processor for each dimension combination that all read directly from the output queue of the fact stream processor. This has the advantage of being really fast to write, but has the disadvantage that each stream processor will effectively scan the entire dataset once.
-//
-// Alternatively, it's possible to maintain the directed graph of data dependency from before and dramatically shrink the amount of data required to generate the "higher level" tables that have fewer dimensional slices. This would require more development work, because the basic fact rows would have to be transformed into a common summary row format, including the serialized HLL/LQE structure.
+While this is an obvious improvement in both the cost of and the responsiveness of the ETL pipeline, it's really only half the job. The ultimate goal is to reduce the pain not only for the ETL pipeline, but also for generating and updating the OLAP cube that drives dashboards and reports. To tackle this problem, we first need to consider how to process the OLAP cube. The cube is already populated via HLL++ and hierarchical updates. The largest pain point - to the tune of 11tb of I/O cost per day - is updating the first aggregate. That's why the new code snippet introduces downstream dependents in the `create_agg_rows` function.
+
+`create_agg_rows` does not expect the data to aggregate well, and so it doens't even try. All 62,500 rows in a batch are likely to be unique from an aggregation perspective considering that there are 1m potential rows to aggregate into. What's important at this level is that the rows are routed such that rows from all rows which aggregate together are routed downstream towards the same consumer. This not only increases the aggregation level of the downstream streaming consumers, but also decreases database contention as there are not multiple consumers modifying a single value.  As each piece of stream processing code creates aggregates and passes to the next, it remains important that the I/O costs remain low and the data is passed to a single consumer for a single logical output row.
+
+## Stream Processing: Cost Analysis
+
+Keeping costs low when doing any kind of processing is always a priority. While fact insertion via stream processing is trivially a massive improvement, it remains to be seen whether stream processing for OLAP is actually a performance improvement or penalty. Calculating the cost for the OLAP stream processor is somewhat tricky. The default batch size is 4mb at the fact level, and those events just get passed on for an additional 2.2tb of write and 2.2tb of read costs.
+
+Given a 5 minute delay in processing at the first step, we would generally expect to see each of the 1m aggregate rows receive 120 updates. The database update cost for that will be 2.5gb as it effectively replaces the daily aggregate in entirety. This will happen 288 times per day for a total aggregate cost of 720gb at the database layer. However, these rows will be passed on to the next consumers in the hierarchical table update. It should be noted that because the aggregates for all five dimension cubes are built exactly the same way, it's not necessary to create separate streams for them. Instead, the updates can be applied directly to them at the same time as the daily aggregates.
+
+This is what the stream processing workflow would look like at this point:
+
+![Completed Stream Processing System](images/stream_proc2.png)
+
+The general costs of stream processing will line out as follows:
+* `impressions` 10.4tb queue read, 2.2tb DB write, 2.2tb queue write
+* `imps_by_advertiser_creative_dest_url_*` 2.2tb queue read, 5 * 720gb DB write, 720gb queue write
+* `imps_by_advertiser_creative_*`, 720gb queue read, 5 * 73gb DB write
+* `imps_by_advertiser_dest_url_*`, 720gb queue read, 5 * 7.3gb DB write, 7.3gb queue write
+* `imps_by_advertiser_*` 7.3gb queue read, 5 * 720mb DB write, 720mb queue write
+* `imps_by_*`, 720mb queue read, 5 * 720kb DB write
+* Total: 23tb
+
+For the example ad DSP, stream processing would cut data warehousing I/O costs from 83tb to 23tb and provide the data much more rapidly.
