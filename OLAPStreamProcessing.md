@@ -416,5 +416,7 @@ For the example ad DSP, stream processing would cut data warehousing I/O costs f
 
 References:
 [1] Srivatsa Moddodi et al, "Data Deduplication Techniques and Analysis by Srivatsa Maddodi", 978-0-7695-4246-1/10 pp 664, http://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=5698409&tag=1
+
 [2] MillWheel: Fault-Tolerant Stream Processing at Internet Scale, http://research.google.com/pubs/pub41378.html
+
 [3] HyperLogLog in Practice: Algorithmic Engineering of a State of The Art Cardinality Estimation Algorithm, http://research.google.com/pubs/pub40671.html
