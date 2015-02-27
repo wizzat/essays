@@ -71,7 +71,7 @@ In this case, the data on the ad tracking servers is periodically collected and 
 
 Once the data is in the stage table, missing dimensions need to be created. There's a linear cost for scanning the stage table for each dimension, as well as the cost for scanning the dimension tables. The I/O cost of the dimension tables are neglected entirely because their size compared to the stage table is tiny. Once the dimension keys exist for all of the data in the stage table, the data is ready to be inserted into the fact table.
 
-Inserting into a fact table in a data warehouse is usually more complicated than a simple insert. Instead, the data must be carefully checked to ensure that it is inserted into the correct partition. Partitions act as "sub tables" that naturally divide the search space for queries and prevent indexes from getting too large. This is also the last step where duplicate data can be taken care of before corrupting the fact data. It's generally trivial enough to group by all fields or provide a distinct operator. Because the dataset cannot fit into memory, either one will result in a `n log n` sort of the underlying dataset[1], so this step can be expensive on the read side as well as for writing. Here's a visualization of what the data flow looks like so far:
+Inserting into a fact table in a data warehouse is usually more complicated than a simple insert. Instead, the data must be carefully checked to ensure that it is inserted into the correct partition. Partitions act as "sub tables" that naturally divide the search space for queries and prevent indexes from getting too large. This is also the last step where duplicate data can be taken care of before corrupting the fact data. It's generally trivial enough to group by all fields or provide a distinct operator. Because the dataset cannot fit into memory, either one will result in a `n log n` sort of the underlying dataset[2], so this step can be expensive on the read side as well as for writing. Here's a visualization of what the data flow looks like so far:
 
 ![Batch ETL Dataflow](images/batch_etl.png)
 
@@ -414,9 +414,12 @@ The general costs of stream processing will line out as follows:
 
 For the example ad DSP, stream processing would cut data warehousing I/O costs from 93tb to 33tb and provide the data much more rapidly.
 
-References:
-[1] Srivatsa Moddodi et al, "Data Deduplication Techniques and Analysis by Srivatsa Maddodi", 978-0-7695-4246-1/10 pp 664, http://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=5698409&tag=1
+## References:
 
-[2] MillWheel: Fault-Tolerant Stream Processing at Internet Scale, http://research.google.com/pubs/pub41378.html
+[1] The School of Hard Knocks (my resume)
 
-[3] HyperLogLog in Practice: Algorithmic Engineering of a State of The Art Cardinality Estimation Algorithm, http://research.google.com/pubs/pub40671.html
+[2] Srivatsa Moddodi et al, "Data Deduplication Techniques and Analysis by Srivatsa Maddodi", 978-0-7695-4246-1/10 pp 664, http://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=5698409&tag=1
+
+[3] MillWheel: Fault-Tolerant Stream Processing at Internet Scale, http://research.google.com/pubs/pub41378.html
+
+[4] HyperLogLog in Practice: Algorithmic Engineering of a State of The Art Cardinality Estimation Algorithm, http://research.google.com/pubs/pub40671.html
