@@ -67,9 +67,9 @@ It is necessary to consider how raw data is processed into facts when calculatin
 
 In this case, the data on the ad tracking servers is periodically collected and copied into the stage table in the data warehouse throughout the day. This is a linear cost across the raw dataset that's pretty unavoidable. Data delivery from the ad tracking servers to the stage table operates on an at least once mechanism because exactly once is very difficult and data which never arrives is never counted. This is called a _delivery semantic_, and is discussed in much more detail below. It's expected that there will be duplicates in the stage table at any given time.
 
-Once the data is in the stage table, missing dimensions need to be created. There's a linear cost for scanning the stage table for each dimension, as well as the cost for scanning the dimension tables. Because the total number of elements in the dimension tables is so small compared to the stage table, the I/O costs for scanning them are neglected entirely. Once the dimension keys exist for all of the data in the stage table, it's ready to be inserted into the fact table.
+Once the data is in the stage table, missing dimensions need to be created. There's a linear cost for scanning the stage table for each dimension, as well as the cost for scanning the dimension tables. The I/O cost of the dimension tables are neglected entirely because their size compared to the stage table is tiny. Once the dimension keys exist for all of the data in the stage table, the data ready to be inserted into the fact table.
 
-Inserting into a fact table in a data warehouse is usually more complicated than a simple insert. Instead, the data must be carefully checked to ensure that it is inserted into the correct partition. Partitions act as "sub tables" that naturally divide the search space for queries and prevent indexes from getting too large. This is also the last step where duplicate data can be taken care of before corrupting the fact data. It's generally trivial enough to group by all fields or provide a distinct operator. Because the dataset cannot fit into memory, either one will result in a `n log n` sort of the underlying dataset, so this step can be expensive on the read side as well as for writing. Here's a visualization of what the data flow looks like so far:
+Inserting into a fact table in a data warehouse is usually more complicated than a simple insert. Instead, the data must be carefully checked to ensure that it is inserted into the correct partition. Partitions act as "sub tables" that naturally divide the search space for queries and prevent indexes from getting too large. This is also the last step where duplicate data can be taken care of before corrupting the fact data. It's generally trivial enough to group by all fields or provide a distinct operator. Because the dataset cannot fit into memory, either one will result in a `n log n` sort of the underlying dataset[1], so this step can be expensive on the read side as well as for writing. Here's a visualization of what the data flow looks like so far:
 
 ![Batch ETL Dataflow](images/batch_etl.png)
 
@@ -120,7 +120,7 @@ Some efficiency (but not a lot) in this sample ETL has been sacrificed to illust
 
     -- Total cost: 48tb read, 18tb write = 66tb I/O cost
 
-As long as the fact update rate matches the fact partition interval, the 66tb I/O cost is fairly constant for a day no matter how many times the ETL runs. If the ETL runs less frequently an additional scan per fact partition skipped will be required, and if it runs more frequently an additional scan of the entire existing fact partition will be required per run. An example: updating a daily partition once per hour would take the cost from 66tb to almost 82tb (an additional cost of `11.5 * 2.2tb = 25tb`.
+As long as the fact update rate matches the fact partition interval, the 66tb I/O cost is fairly constant for a day no matter how many times the ETL runs. If the ETL runs less frequently an additional scan per fact partition skipped will be required, and if it runs more frequently an additional scan of the entire existing fact partition will be required per run. An example: updating a daily partition once per hour would take the cost from 66tb to almost 82tb (an additional cost of `0 * 2.2tb + 1/24 * 2.2tb + 2/24 * 2.2tb ... = 25tb`).
 
 ## OLAP Reporting
 
@@ -235,7 +235,7 @@ With the actual aggregation sizes being so small, they're almost wholly neglecta
 * Yearly: 2.2tb * 5 tables * 365 days = 4pb
 * Total: 4pb + 990tb + 330tb + 77tb + 11tb = 5.4pb
 
-It's pretty obvious that most of the really heavy costs start kicking in at the monthly aggregation tier. These costs are so painful and expensive that oftentimes businesses do without necessary information just because it costs too much to calculate it. For this example, we're going to assume that YTD and Year over Year reports are critical metrics to deliver for our advertisers, so we're going to deliver them no matter the cost.
+It's pretty obvious that most of the really heavy costs start kicking in at the monthly aggregation tier. These costs are so painful and expensive that oftentimes businesses do without necessary information just because it costs too much to calculate it. For this example, we're going to assume that delivering YTD and Year over Year reports by 9am are critical metrics to deliver for our advertisers, so we're going to deliver them no matter the cost. Setting a _SLA_ (Service Level Agreement) for ETLs often requires over provisioning the cluster by some amount. In this case, all of the ETL I/O must be compressed into about 8 hours, meaning that the cluster must be over provisioned by at least 3x.
 
 In a fast paced business world, decisions often need to be made more quickly than is allowed by updating performance data merely once per day. The cost for the daily cube sees a 12.5x leap in cost `(1+24/2)`, but most of the others increase by a factor of 24. The daily cube costs less because the early aggregations have so much less to do. Just to make these numbers explicit, the cost of updating performance data hourly rises to:
 * Daily: 11tb -> 138tb (2% total increase)
@@ -263,7 +263,7 @@ However, the only table that would be required to be built from the impressions 
 * `imps_by_advertiser_day`: 25.5mb + 2.54mb
 * `imps_by_day`: 2.54mb + 2.5kb
 
-The total cost matrix after switching to hourly builds, HLL++ for uniques, and hierarchical aggregation builds would become:
+The total cost matrix after switching to hourly builds, [HLL++](http://research.google.com/pubs/pub40671.html) for uniques, and hierarchical aggregation builds would become:
 * Fact Processing: 66tb
 * Daily: 27.tb
 * Weekly: 25.3gb (Built from daily)
@@ -272,7 +272,11 @@ The total cost matrix after switching to hourly builds, HLL++ for uniques, and h
 * Yearly:  38gb (Built from monthly)
 * Total: 93tb
 
-I/O costs going from 74pb to 93tb really puts a spot light on just how painful `count(distinct)` and quantile can be in for required measures. Despite how much better 93tb in I/O cost per day feels, it still seems pretty outrageous considering only 10.4tb of raw data came into the system. I think we can do better.
+I/O costs going from 74pb to 93tb really puts a spot light on just how painful `count(distinct)` and quantile can be in for required measures. Despite how much better 93tb in I/O cost per day feels, it still seems pretty outrageous considering only 10.4tb of raw data came into the system. This is an hourly graph of what the system looks like when the data is processed throughout the day instead of all at once:
+
+![Daily vs Hourly I/O](images/daily_vs_hourly_io.png)
+
+I think we can do better.
 
 ## Stream Processing for Faster Processing
 
@@ -308,7 +312,6 @@ Stream processing is the idea of taking a (potentially never ending) "stream" of
 
     def process_stream(stream):
         events = []
-        committed_offset = stream.offset
 
         for datum in stream:
             imp_event, offset = datum
@@ -317,7 +320,7 @@ Stream processing is the idea of taking a (potentially never ending) "stream" of
             events.append(proc__event)
             if len(events) >= 62500:
                 # Batch size: 18.75mb read, 4mb write
-                write_impressions(events)
+                insert_ignore_into_db(events)
                 events.clear()
                 stream.commit(offset)
 
@@ -327,7 +330,7 @@ A solution like this directly nails the theoretical limit in processing performa
 
 However, the above code has a lot more going on than immediately meets the eye. For example, stream processing systems are run in a highly parallel and concurrent manner. The ad tracking servers for the example ad DSP would all be feeding data into the queue simultaneously, while the stream processing consumers would all be pulling simultaneously. In order for the stream processing system to not fall behind, it must process at least at the same rate as the ads are served (400k/sec). In order to maintain reasonable performance at the database layer, it is necessary to batch writes into the fact table as well. The reason for this is because sequential (bulk) disk access for reads and writes is far more efficient than scattered or random disk access. However, it doesn't take truly enormous batch sizes to make the system efficient - the 4mb size used above should work well in most scenarios.
 
-It's also pretty obvious that no one consumer is going to process that stream alone. So a cluster of stream processors will need to divide the stream up in such away that each event is only processed once, ideally with as little coordination as possible. The requirement to divide the stream up this way means that the queue must provide a _MECE_ (Mutually Exclusive but Collectively Exhaustive) interface. This goal becomes more complicated once system failures are factored in and data which has been processed but not confirmed is lost. The queue not only needs to be MECE, but data which had previously been processed needs to be retried in the order it was originally sent. Thus, the system depends on having a high quality MECE queue with ordered delivery and frequent consumer controlled checkpoints.
+It's also pretty obvious that no one consumer is going to process that stream alone. So a cluster of stream processors will need to divide the stream up in such a way that each event is only processed once, ideally with as little coordination as possible. The requirement to divide the stream up this way means that the queue must provide a _MECE_ (Mutually Exclusive but Collectively Exhaustive) interface. This goal becomes more complicated once system failures are factored in and data which has been processed but not confirmed is lost. The queue not only needs to be MECE, but data which had previously been processed needs to be retried in the order it was originally sent. Thus, the system depends on having a high quality MECE queue with ordered delivery and frequent consumer controlled checkpoints.
 
 Additionally, the _delivery semantics_ of the queue become incredibly important for a stream processing system. For various reasons mostly relating to distributed atomicity, delivering data exactly once is extraordinarily difficult, and obviously missing data can never be counted at all. That means that a stream processing system relies on _at least once_ delivery semantics. Due to the intentional duplication deriving from delivery and process failures, it's of vital importance that consumers be written to properly handle deduplication.
 
@@ -337,7 +340,7 @@ To put some numbers on it, guaranteeing true uniqueness with a naive hash map in
 
 ## Practical Considerations for Stream Processing
 
-It's necessary to consider how stream processing works on a practical level. The previous version of the streaming algorithm didn't account for deduplication, so this is a version that does. There are some notes taken from the Google MillWheel paper in exactly how the deduplication works. In this particular example, there is a primary key on the impressions partitions which is invoked for discarding duplicates that made it through due to error conditions. There are other optimizations available in the MillWheel paper that make this both more robust and faster. 
+It's necessary to consider how stream processing works on a practical level. The previous version of the streaming algorithm didn't account for deduplication, so this is a version that does. There are some notes taken from the Google [MillWheel](http://research.google.com/pubs/pub41378.html) paper in exactly how the deduplication works. In this particular example, there is a primary key on the impressions partitions which is invoked for discarding duplicates that made it through due to error conditions. There are other optimizations available in the MillWheel paper that make this both more robust and faster. 
 
     def unique_event(imp_event):
         imp_event.unique = UniqueService.lookup(imp_event.ad_id)
@@ -359,7 +362,6 @@ It's necessary to consider how stream processing works on a practical level. The
 
     def process_stream(stream):
         events = []
-        committed_offset = stream.offset
 
         for datum in stream:
             imp_event, offset = datum
@@ -406,4 +408,18 @@ The general costs of stream processing will line out as follows:
 * `imps_by_*`, 720mb queue read, 5 * 720kb DB write
 * Total: 33tb
 
+![Stream Processing I/O Breakdown](images/hourly_vs_stream_io.png)
+
 For the example ad DSP, stream processing would cut data warehousing I/O costs from 93tb to 33tb and provide the data much more rapidly.
+
+References:
+[1] Srivatsa Moddodi et al, "Data Deduplication Techniques and Analysis by Srivatsa Maddodi", 978-0-7695-4246-1/10 pp 664, http://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=5698409&tag=1
+[2] MillWheel: Fault-Tolerant Stream Processing at Internet Scale, http://research.google.com/pubs/pub41378.html
+[3] HyperLogLog in Practice: Algorithmic Engineering of a State of The Art Cardinality Estimation Algorithm, http://research.google.com/pubs/pub40671.html
+
+TODO:
+- How is back processing handled with SLA for current data
+- Latencies for stream processing
+- Explain where the numbers come from. FORMULAS, BITCH
+- Explain where the total cost increases come from in the hourly batch processing case
+- Spell out implicit assertion of autocommit
