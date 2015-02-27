@@ -1,4 +1,6 @@
 # OLAP Stream Processing
+By: Mark Roberts (@wizzat), Feb 2015
+
 ## A Data Whathouse? Wizzat?!
 
 A data warehouse is a structure for consuming, organizing, storing, and reporting on data. The most common form of data warehousing today is the snowflake schema OLAP data warehouse. These warehouses are broken down into "facts" and "dimensions" (both defined later), with reporting being handled by a full or partial "OLAP Cube" (also defined later).
@@ -23,7 +25,7 @@ In this example, the ad tracking servers are emitting JSON formatted events that
         "dest_url": "https://www.facebook.com/wizzat"
     } // 284 bytes (round up to 300)
 
-These events are streamed from the ad tracking servers to a centralized location where they reside on disk ready to be processed once per day. SQL is exceedingly common for performing data processing in a data warehouse, so it will also form the basis for many of the examples here. The stage table schema the data is dumped into throughout the day looks like this:
+These events are streamed from the ad tracking servers to a centralized location where they reside on disk ready to be processed once per day. SQL is exceedingly common for performing data processing in a data warehouse, so it will also form the basis for many of the examples here. The stage table the data is dumped into throughout the day looks like this:
 
     CREATE TABLE impressions_stage (
         imp_id UUID,         -- A unique ID
@@ -67,7 +69,7 @@ It is necessary to consider how raw data is processed into facts when calculatin
 
 In this case, the data on the ad tracking servers is periodically collected and copied into the stage table in the data warehouse throughout the day. This is a linear cost across the raw dataset that's pretty unavoidable. Data delivery from the ad tracking servers to the stage table operates on an at least once mechanism because exactly once is very difficult and data which never arrives is never counted. This is called a _delivery semantic_, and is discussed in much more detail below. It's expected that there will be duplicates in the stage table at any given time.
 
-Once the data is in the stage table, missing dimensions need to be created. There's a linear cost for scanning the stage table for each dimension, as well as the cost for scanning the dimension tables. The I/O cost of the dimension tables are neglected entirely because their size compared to the stage table is tiny. Once the dimension keys exist for all of the data in the stage table, the data ready to be inserted into the fact table.
+Once the data is in the stage table, missing dimensions need to be created. There's a linear cost for scanning the stage table for each dimension, as well as the cost for scanning the dimension tables. The I/O cost of the dimension tables are neglected entirely because their size compared to the stage table is tiny. Once the dimension keys exist for all of the data in the stage table, the data is ready to be inserted into the fact table.
 
 Inserting into a fact table in a data warehouse is usually more complicated than a simple insert. Instead, the data must be carefully checked to ensure that it is inserted into the correct partition. Partitions act as "sub tables" that naturally divide the search space for queries and prevent indexes from getting too large. This is also the last step where duplicate data can be taken care of before corrupting the fact data. It's generally trivial enough to group by all fields or provide a distinct operator. Because the dataset cannot fit into memory, either one will result in a `n log n` sort of the underlying dataset[1], so this step can be expensive on the read side as well as for writing. Here's a visualization of what the data flow looks like so far:
 
@@ -160,7 +162,7 @@ Now, suppose that the advertiser performance by day report is showing a peculiar
     GROUP BY 1, 2, 3
     -- Cost = 2.2tb * 7 = 15.4tb
 
-Any particular view of the data may not explain the performance irregularity, so oftentimes its important to be able to look at the data from different perspectives ("dicing" it). Replacing `dest_url_id` with `creative_id` might reveal that the advertiser started a new ad campaign with several new creatives. Oftentimes it's important to be able to "slice" data away (exclude it) to get a better view of the "natural" performance:
+Any particular view of the data may not explain the performance irregularity, so oftentimes it's important to look at the data from different perspectives, that is "dicing" it. Replacing `dest_url_id` with `creative_id` might reveal that the advertiser started a new ad campaign with several new creatives. It's also important to be able to "slice" data away (exclude it) to get a better view of the "natural" performance:
 
     SELECT
         imp_time::date          AS day,
